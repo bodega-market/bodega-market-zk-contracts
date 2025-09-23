@@ -1,0 +1,339 @@
+// Bodega Market Factory Contract
+// Creates and manages prediction markets with privacy-preserving features
+
+include "std";
+include "types";
+
+// Market factory ledger state
+ledger MarketFactoryLedger {
+    marketCount: Field;
+    totalMarkets: Field;
+    activeMarkets: Field;
+    totalVolume: Field;
+    protocolTreasury: Field;
+    factoryOwner: Address;
+    paused: Bool;
+    minCreatorBond: Field;
+    marketRegistry: Map<MarketId, MarketMetadata>;
+    creatorBonds: Map<MarketId, Bond>;
+}
+
+// Market factory implementation
+contract MarketFactory {
+    
+    // Initialize the factory
+    export circuit initialize(
+        owner: Address,
+        initialBond: Field
+    ): Void {
+        this.marketCount = Field(0);
+        this.totalMarkets = Field(0);
+        this.activeMarkets = Field(0);
+        this.totalVolume = Field(0);
+        this.protocolTreasury = Field(0);
+        this.factoryOwner = owner;
+        this.paused = false;
+        this.minCreatorBond = initialBond;
+    }
+
+    // Create a new prediction market
+    export circuit createMarket(
+        creator: Address,
+        question: String,
+        description: String,
+        resolutionCriteria: String,
+        endTime: Timestamp,
+        currentTime: Timestamp,
+        bondAmount: Field
+    ): MarketId {
+        // Validate inputs
+        assert(!this.paused, "Factory is paused");
+        assert(bondAmount >= this.minCreatorBond, "Insufficient creator bond");
+        assert(endTime > currentTime, "End time must be in future");
+        assert(endTime <= currentTime + Field(31536000), "End time too far in future"); // Max 1 year
+        
+        // Generate unique market ID
+        let marketId = poseidon(
+            creator.toBytes(),
+            question.toBytes(),
+            currentTime.toBytes(),
+            this.marketCount.toBytes()
+        );
+        
+        // Calculate resolution deadline (24 hours after market end)
+        let resolutionDeadline = endTime + Field(86400);
+        let challengePeriodEnd = resolutionDeadline + Field(86400); // Additional 24 hours for challenges
+        
+        // Create market metadata
+        let metadata = MarketMetadata {
+            id: marketId,
+            question: question,
+            description: description,
+            resolutionCriteria: resolutionCriteria,
+            creator: creator,
+            endTime: endTime,
+            resolutionDeadline: resolutionDeadline,
+            challengePeriodEnd: challengePeriodEnd,
+            creatorBond: bondAmount,
+            minLiquidity: Field(0),
+            status: MarketStatus::CREATED,
+            createdAt: currentTime
+        };
+        
+        // Create creator bond
+        let bond = Bond {
+            bondId: poseidon(marketId.toBytes(), creator.toBytes()),
+            user: creator,
+            amount: bondAmount,
+            bondType: Field(1), // Creator bond
+            lockedAt: currentTime,
+            releaseConditions: Field(1), // Released on successful resolution
+            released: false,
+            slashed: false
+        };
+        
+        // Store in ledger
+        this.marketRegistry = this.marketRegistry.insert(marketId, metadata);
+        this.creatorBonds = this.creatorBonds.insert(marketId, bond);
+        
+        // Update counters
+        this.marketCount = this.marketCount + Field(1);
+        this.totalMarkets = this.totalMarkets + Field(1);
+        this.activeMarkets = this.activeMarkets + Field(1);
+        
+        // Emit event for indexing
+        emit MarketCreatedEvent {
+            marketId: marketId,
+            creator: creator,
+            question: question,
+            endTime: endTime,
+            createdAt: currentTime
+        };
+        
+        return marketId;
+    }
+
+    // Activate a market (move from CREATED to ACTIVE)
+    export circuit activateMarket(
+        marketId: MarketId,
+        initialLiquidity: Field,
+        currentTime: Timestamp
+    ): Bool {
+        // Get market metadata
+        let metadata = this.marketRegistry.get(marketId);
+        assert(metadata.status == MarketStatus::CREATED, "Market not in CREATED state");
+        assert(currentTime < metadata.endTime, "Market has already ended");
+        assert(initialLiquidity > Field(0), "Initial liquidity required");
+        
+        // Update market status
+        let updatedMetadata = MarketMetadata {
+            ...metadata,
+            status: MarketStatus::ACTIVE,
+            minLiquidity: initialLiquidity
+        };
+        
+        this.marketRegistry = this.marketRegistry.insert(marketId, updatedMetadata);
+        
+        return true;
+    }
+
+    // Cancel a market (only creator, only if no bets placed)
+    export circuit cancelMarket(
+        marketId: MarketId,
+        caller: Address,
+        currentTime: Timestamp
+    ): Bool {
+        let metadata = this.marketRegistry.get(marketId);
+        assert(caller == metadata.creator, "Only creator can cancel");
+        assert(metadata.status == MarketStatus::CREATED, "Can only cancel CREATED markets");
+        
+        // Update market status
+        let updatedMetadata = MarketMetadata {
+            ...metadata,
+            status: MarketStatus::CANCELLED
+        };
+        
+        this.marketRegistry = this.marketRegistry.insert(marketId, updatedMetadata);
+        
+        // Release creator bond
+        let bond = this.creatorBonds.get(marketId);
+        let releasedBond = Bond {
+            ...bond,
+            released: true
+        };
+        this.creatorBonds = this.creatorBonds.insert(marketId, releasedBond);
+        
+        // Update active market counter
+        this.activeMarkets = this.activeMarkets - Field(1);
+        
+        return true;
+    }
+
+    // End a market when time expires
+    export circuit endMarket(
+        marketId: MarketId,
+        currentTime: Timestamp
+    ): Bool {
+        let metadata = this.marketRegistry.get(marketId);
+        assert(metadata.status == MarketStatus::ACTIVE, "Market not active");
+        assert(currentTime >= metadata.endTime, "Market has not ended yet");
+        
+        // Update market status
+        let updatedMetadata = MarketMetadata {
+            ...metadata,
+            status: MarketStatus::ENDED
+        };
+        
+        this.marketRegistry = this.marketRegistry.insert(marketId, updatedMetadata);
+        
+        return true;
+    }
+
+    // Mark market as resolved
+    export circuit resolveMarket(
+        marketId: MarketId,
+        outcome: Outcome,
+        oracle: OracleId,
+        currentTime: Timestamp
+    ): Bool {
+        let metadata = this.marketRegistry.get(marketId);
+        assert(metadata.status == MarketStatus::ENDED, "Market not ended");
+        assert(currentTime >= metadata.endTime, "Too early to resolve");
+        assert(currentTime <= metadata.resolutionDeadline, "Resolution deadline passed");
+        
+        // Update market status
+        let updatedMetadata = MarketMetadata {
+            ...metadata,
+            status: MarketStatus::RESOLVED
+        };
+        
+        this.marketRegistry = this.marketRegistry.insert(marketId, updatedMetadata);
+        
+        // Emit resolution event
+        emit MarketResolvedEvent {
+            marketId: marketId,
+            outcome: outcome,
+            oracle: oracle,
+            confidence: Field(100), // Full confidence for single oracle
+            timestamp: currentTime
+        };
+        
+        return true;
+    }
+
+    // Settle market and release creator bond
+    export circuit settleMarket(
+        marketId: MarketId,
+        currentTime: Timestamp
+    ): Bool {
+        let metadata = this.marketRegistry.get(marketId);
+        assert(metadata.status == MarketStatus::RESOLVED, "Market not resolved");
+        assert(currentTime >= metadata.challengePeriodEnd, "Challenge period not over");
+        
+        // Update market status
+        let updatedMetadata = MarketMetadata {
+            ...metadata,
+            status: MarketStatus::SETTLED
+        };
+        
+        this.marketRegistry = this.marketRegistry.insert(marketId, updatedMetadata);
+        
+        // Release creator bond
+        let bond = this.creatorBonds.get(marketId);
+        let releasedBond = Bond {
+            ...bond,
+            released: true
+        };
+        this.creatorBonds = this.creatorBonds.insert(marketId, releasedBond);
+        
+        // Update active market counter
+        this.activeMarkets = this.activeMarkets - Field(1);
+        
+        return true;
+    }
+
+    // Clean up expired markets
+    export circuit cleanupExpiredMarkets(
+        marketIds: MarketId[],
+        currentTime: Timestamp
+    ): Field {
+        let cleanedCount = Field(0);
+        
+        for (marketId in marketIds) {
+            let metadata = this.marketRegistry.get(marketId);
+            
+            // Clean up if settlement deadline passed and unclaimed
+            if (metadata.status == MarketStatus::SETTLED && 
+                currentTime > metadata.challengePeriodEnd + SETTLEMENT_DEADLINE) {
+                
+                // Archive market data
+                let archivedMetadata = MarketMetadata {
+                    ...metadata,
+                    status: MarketStatus::CANCELLED // Use CANCELLED to indicate archived
+                };
+                
+                this.marketRegistry = this.marketRegistry.insert(marketId, archivedMetadata);
+                cleanedCount = cleanedCount + Field(1);
+            }
+        }
+        
+        return cleanedCount;
+    }
+
+    // Query functions
+    export circuit getMarket(marketId: MarketId): MarketMetadata {
+        return this.marketRegistry.get(marketId);
+    }
+
+    export circuit getMarketBond(marketId: MarketId): Bond {
+        return this.creatorBonds.get(marketId);
+    }
+
+    export circuit getFactoryStats(): (Field, Field, Field, Field) {
+        return (this.totalMarkets, this.activeMarkets, this.totalVolume, this.protocolTreasury);
+    }
+
+    export circuit isMarketActive(marketId: MarketId, currentTime: Timestamp): Bool {
+        let metadata = this.marketRegistry.get(marketId);
+        return metadata.status == MarketStatus::ACTIVE && currentTime < metadata.endTime;
+    }
+
+    export circuit canResolve(marketId: MarketId, currentTime: Timestamp): Bool {
+        let metadata = this.marketRegistry.get(marketId);
+        return metadata.status == MarketStatus::ENDED && 
+               currentTime >= metadata.endTime &&
+               currentTime <= metadata.resolutionDeadline;
+    }
+
+    export circuit canSettle(marketId: MarketId, currentTime: Timestamp): Bool {
+        let metadata = this.marketRegistry.get(marketId);
+        return metadata.status == MarketStatus::RESOLVED &&
+               currentTime >= metadata.challengePeriodEnd;
+    }
+
+    // Admin functions
+    export circuit pause(caller: Address): Bool {
+        assert(caller == this.factoryOwner, "Only owner can pause");
+        this.paused = true;
+        return true;
+    }
+
+    export circuit unpause(caller: Address): Bool {
+        assert(caller == this.factoryOwner, "Only owner can unpause");
+        this.paused = false;
+        return true;
+    }
+
+    export circuit updateMinBond(caller: Address, newBond: Field): Bool {
+        assert(caller == this.factoryOwner, "Only owner can update bond");
+        assert(newBond > Field(0), "Bond must be positive");
+        this.minCreatorBond = newBond;
+        return true;
+    }
+
+    export circuit transferOwnership(caller: Address, newOwner: Address): Bool {
+        assert(caller == this.factoryOwner, "Only owner can transfer ownership");
+        this.factoryOwner = newOwner;
+        return true;
+    }
+}

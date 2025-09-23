@@ -1,0 +1,475 @@
+// Bodega Prediction Market Contract
+// Core market logic with UTXO batching and privacy-preserving position management
+
+include "std";
+include "types";
+
+// Prediction market ledger state
+ledger PredictionMarketLedger {
+    marketId: MarketId;
+    state: MarketState;
+    metadata: MarketMetadata;
+    
+    // Batching system
+    currentBatch: BatchedPositionUTXO;
+    completedBatches: Map<Bytes32, BatchedPositionUTXO>;
+    batchQueue: PositionCommitment[];
+    
+    // Position tracking
+    positionCommitments: Map<Bytes32, PositionCommitment>;
+    merkleRoots: Map<Bytes32, Bytes32>; // batchId -> merkleRoot
+    
+    // AMM state
+    liquidityPool: Field;
+    feeCollected: Field;
+    
+    // Resolution data
+    resolution: Resolution;
+    settled: Bool;
+    
+    // Cleanup tracking
+    cleanupPolicy: CleanupPolicy;
+    expiredPositions: Map<Bytes32, Bool>;
+}
+
+// Main prediction market contract
+contract PredictionMarket {
+    
+    // Initialize a new prediction market
+    export circuit initialize(
+        marketId: MarketId,
+        metadata: MarketMetadata,
+        initialLiquidity: Field
+    ): Void {
+        this.marketId = marketId;
+        this.metadata = metadata;
+        
+        // Initialize market state with equal shares for balanced pricing
+        this.state = MarketState {
+            id: marketId,
+            sharesYes: initialLiquidity,
+            sharesNo: initialLiquidity,
+            invariant: initialLiquidity * initialLiquidity,
+            liquidityParameter: initialLiquidity / Field(2), // b = liquidity/2 for LMSR
+            totalVolume: Field(0),
+            activePositions: Field(0),
+            lastTradeTime: metadata.createdAt,
+            batchCounter: Field(0)
+        };
+        
+        // Initialize empty batch
+        this.currentBatch = BatchedPositionUTXO {
+            batchId: poseidon(marketId.toBytes(), Field(0).toBytes()),
+            merkleRoot: Bytes32::zero(),
+            totalValue: Field(0),
+            positionCount: Field(0),
+            batchTimestamp: metadata.createdAt,
+            marketId: marketId,
+            processed: false
+        };
+        
+        this.liquidityPool = initialLiquidity;
+        this.feeCollected = Field(0);
+        this.settled = false;
+        
+        // Initialize cleanup policy
+        this.cleanupPolicy = CleanupPolicy {
+            settlementDeadline: SETTLEMENT_DEADLINE,
+            archivalThreshold: ARCHIVAL_THRESHOLD,
+            batchCleanupSize: Field(100),
+            enabled: true
+        };
+    }
+
+    // Add position to current batch
+    export circuit addPositionToBatch(
+        commitment: Bytes32,
+        amount: Field,
+        outcome: Outcome,
+        currentTime: Timestamp
+    ): PositionId {
+        // Validate market is active
+        assert(this.metadata.status == MarketStatus::ACTIVE, "Market not active");
+        assert(currentTime < this.metadata.endTime, "Market has ended");
+        assert(amount > Field(0), "Amount must be positive");
+        
+        // Generate position ID
+        let positionId = poseidon(
+            commitment.toBytes(),
+            amount.toBytes(),
+            currentTime.toBytes()
+        );
+        
+        // Create position commitment
+        let position = PositionCommitment {
+            commitment: commitment,
+            amount: amount,
+            outcome: outcome,
+            timestamp: currentTime,
+            batchId: this.currentBatch.batchId,
+            leafIndex: this.currentBatch.positionCount
+        };
+        
+        // Add to batch queue
+        this.batchQueue = this.batchQueue.push(position);
+        this.positionCommitments = this.positionCommitments.insert(positionId, position);
+        
+        // Update current batch
+        this.currentBatch = BatchedPositionUTXO {
+            ...this.currentBatch,
+            totalValue: this.currentBatch.totalValue + amount,
+            positionCount: this.currentBatch.positionCount + Field(1)
+        };
+        
+        // Check if batch is ready to process
+        if (this.currentBatch.positionCount >= MAX_BATCH_SIZE ||
+            currentTime >= this.currentBatch.batchTimestamp + BATCH_WINDOW_SIZE) {
+            this.processBatch(currentTime);
+        }
+        
+        return positionId;
+    }
+
+    // Process current batch and create new one
+    export circuit processBatch(currentTime: Timestamp): Bool {
+        assert(this.currentBatch.positionCount > Field(0), "Empty batch");
+        
+        // Build Merkle tree from position commitments
+        let merkleRoot = this.buildMerkleTree(this.batchQueue);
+        
+        // Finalize current batch
+        let finalizedBatch = BatchedPositionUTXO {
+            ...this.currentBatch,
+            merkleRoot: merkleRoot,
+            batchTimestamp: currentTime,
+            processed: true
+        };
+        
+        // Store completed batch
+        this.completedBatches = this.completedBatches.insert(
+            this.currentBatch.batchId, 
+            finalizedBatch
+        );
+        this.merkleRoots = this.merkleRoots.insert(
+            this.currentBatch.batchId,
+            merkleRoot
+        );
+        
+        // Update market state with batch totals
+        let (totalYes, totalNo) = this.calculateBatchTotals(this.batchQueue);
+        this.updateAMMState(totalYes, totalNo, currentTime);
+        
+        // Create new batch
+        let newBatchCounter = this.state.batchCounter + Field(1);
+        this.currentBatch = BatchedPositionUTXO {
+            batchId: poseidon(this.marketId.toBytes(), newBatchCounter.toBytes()),
+            merkleRoot: Bytes32::zero(),
+            totalValue: Field(0),
+            positionCount: Field(0),
+            batchTimestamp: currentTime,
+            marketId: this.marketId,
+            processed: false
+        };
+        
+        // Update state
+        this.state = MarketState {
+            ...this.state,
+            batchCounter: newBatchCounter,
+            lastTradeTime: currentTime,
+            activePositions: this.state.activePositions + this.batchQueue.length()
+        };
+        
+        // Clear batch queue
+        this.batchQueue = [];
+        
+        // Emit batch processed event
+        emit BatchProcessedEvent {
+            batchId: finalizedBatch.batchId,
+            marketId: this.marketId,
+            positionCount: finalizedBatch.positionCount,
+            totalVolume: finalizedBatch.totalValue,
+            timestamp: currentTime
+        };
+        
+        return true;
+    }
+
+    // Build Merkle tree from position commitments
+    circuit buildMerkleTree(positions: PositionCommitment[]): Bytes32 {
+        if (positions.length() == Field(0)) {
+            return Bytes32::zero();
+        }
+        
+        // Create leaf nodes from position commitments
+        let leaves: Bytes32[] = [];
+        for (position in positions) {
+            let leaf = poseidon(
+                position.commitment.toBytes(),
+                position.amount.toBytes(),
+                position.outcome.toBytes(),
+                position.timestamp.toBytes()
+            );
+            leaves = leaves.push(leaf);
+        }
+        
+        // Build tree bottom-up
+        while (leaves.length() > Field(1)) {
+            let newLevel: Bytes32[] = [];
+            let i = Field(0);
+            
+            while (i < leaves.length()) {
+                if (i + Field(1) < leaves.length()) {
+                    // Pair exists
+                    let combined = poseidon(
+                        leaves[i].toBytes(),
+                        leaves[i + Field(1)].toBytes()
+                    );
+                    newLevel = newLevel.push(combined);
+                    i = i + Field(2);
+                } else {
+                    // Odd leaf, hash with itself
+                    let combined = poseidon(
+                        leaves[i].toBytes(),
+                        leaves[i].toBytes()
+                    );
+                    newLevel = newLevel.push(combined);
+                    i = i + Field(1);
+                }
+            }
+            
+            leaves = newLevel;
+        }
+        
+        return leaves[0];
+    }
+
+    // Calculate batch totals by outcome
+    circuit calculateBatchTotals(positions: PositionCommitment[]): (Field, Field) {
+        let totalYes = Field(0);
+        let totalNo = Field(0);
+        
+        for (position in positions) {
+            if (position.outcome == Outcome::YES) {
+                totalYes = totalYes + position.amount;
+            } else {
+                totalNo = totalNo + position.amount;
+            }
+        }
+        
+        return (totalYes, totalNo);
+    }
+
+    // Update AMM state with new positions
+    circuit updateAMMState(
+        newYes: Field,
+        newNo: Field,
+        currentTime: Timestamp
+    ): Void {
+        // Apply trading fee (0.3%)
+        let feeYes = newYes * Field(3) / Field(1000);
+        let feeNo = newNo * Field(3) / Field(1000);
+        let netYes = newYes - feeYes;
+        let netNo = newNo - feeNo;
+        
+        // Update share totals
+        let updatedSharesYes = this.state.sharesYes + netYes;
+        let updatedSharesNo = this.state.sharesNo + netNo;
+        
+        // Maintain constant product invariant
+        let newInvariant = updatedSharesYes * updatedSharesNo;
+        
+        // Update state
+        this.state = MarketState {
+            ...this.state,
+            sharesYes: updatedSharesYes,
+            sharesNo: updatedSharesNo,
+            invariant: newInvariant,
+            totalVolume: this.state.totalVolume + newYes + newNo,
+            lastTradeTime: currentTime
+        };
+        
+        // Collect fees
+        this.feeCollected = this.feeCollected + feeYes + feeNo;
+    }
+
+    // Calculate current market prices using constant product formula
+    export circuit getCurrentPrices(): (Field, Field) {
+        let total = this.state.sharesYes + this.state.sharesNo;
+        assert(total > Field(0), "No liquidity");
+        
+        // Price = shares / total_shares (as ratio, multiply by 100 for percentage)
+        let priceYes = (this.state.sharesYes * Field(100)) / total;
+        let priceNo = (this.state.sharesNo * Field(100)) / total;
+        
+        return (priceYes, priceNo);
+    }
+
+    // Verify position is in a specific batch (for claiming)
+    export circuit verifyPositionInBatch(
+        positionId: PositionId,
+        batchId: Bytes32,
+        merkleProof: Bytes32[]
+    ): Bool {
+        let position = this.positionCommitments.get(positionId);
+        assert(position.batchId == batchId, "Position not in specified batch");
+        
+        let batch = this.completedBatches.get(batchId);
+        assert(batch.processed, "Batch not processed");
+        
+        // Verify Merkle proof
+        let leaf = poseidon(
+            position.commitment.toBytes(),
+            position.amount.toBytes(),
+            position.outcome.toBytes(),
+            position.timestamp.toBytes()
+        );
+        
+        return this.verifyMerkleProof(leaf, merkleProof, batch.merkleRoot);
+    }
+
+    // Verify Merkle proof
+    circuit verifyMerkleProof(
+        leaf: Bytes32,
+        proof: Bytes32[],
+        root: Bytes32
+    ): Bool {
+        let currentHash = leaf;
+        
+        for (proofElement in proof) {
+            currentHash = poseidon(
+                currentHash.toBytes(),
+                proofElement.toBytes()
+            );
+        }
+        
+        return currentHash == root;
+    }
+
+    // Resolve market with outcome
+    export circuit resolveMarket(
+        outcome: Outcome,
+        oracle: OracleId,
+        evidence: String,
+        currentTime: Timestamp
+    ): Bool {
+        assert(this.metadata.status == MarketStatus::ENDED, "Market not ended");
+        assert(currentTime >= this.metadata.endTime, "Too early to resolve");
+        assert(currentTime <= this.metadata.resolutionDeadline, "Resolution deadline passed");
+        
+        // Process any remaining batch
+        if (this.currentBatch.positionCount > Field(0)) {
+            this.processBatch(currentTime);
+        }
+        
+        // Store resolution
+        this.resolution = Resolution {
+            marketId: this.marketId,
+            outcome: outcome,
+            primaryOracle: oracle,
+            submittedAt: currentTime,
+            evidence: evidence,
+            bond: Field(0), // Will be set by oracle system
+            consensusReached: true,
+            confidence: Field(100),
+            supportingOracles: Field(1)
+        };
+        
+        // Update metadata
+        this.metadata = MarketMetadata {
+            ...this.metadata,
+            status: MarketStatus::RESOLVED
+        };
+        
+        return true;
+    }
+
+    // Settle market after challenge period
+    export circuit settleMarket(currentTime: Timestamp): Bool {
+        assert(this.metadata.status == MarketStatus::RESOLVED, "Market not resolved");
+        assert(currentTime >= this.metadata.challengePeriodEnd, "Challenge period not over");
+        
+        this.metadata = MarketMetadata {
+            ...this.metadata,
+            status: MarketStatus::SETTLED
+        };
+        
+        this.settled = true;
+        return true;
+    }
+
+    // Clean up expired positions
+    export circuit cleanupExpiredPositions(
+        expiredCommitments: Bytes32[],
+        currentTime: Timestamp
+    ): Field {
+        assert(this.settled, "Market not settled");
+        assert(this.cleanupPolicy.enabled, "Cleanup not enabled");
+        
+        let cleanedCount = Field(0);
+        let maxCleanup = this.cleanupPolicy.batchCleanupSize;
+        
+        for (commitment in expiredCommitments) {
+            if (cleanedCount >= maxCleanup) break;
+            
+            // Verify position is expired (past settlement deadline)
+            if (currentTime > this.metadata.challengePeriodEnd + this.cleanupPolicy.settlementDeadline) {
+                this.expiredPositions = this.expiredPositions.insert(commitment, true);
+                cleanedCount = cleanedCount + Field(1);
+            }
+        }
+        
+        // Update active positions count
+        this.state = MarketState {
+            ...this.state,
+            activePositions: this.state.activePositions - cleanedCount
+        };
+        
+        return cleanedCount;
+    }
+
+    // Query functions
+    export circuit getMarketState(): MarketState {
+        return this.state;
+    }
+
+    export circuit getMarketMetadata(): MarketMetadata {
+        return this.metadata;
+    }
+
+    export circuit getResolution(): Resolution {
+        return this.resolution;
+    }
+
+    export circuit getBatch(batchId: Bytes32): BatchedPositionUTXO {
+        return this.completedBatches.get(batchId);
+    }
+
+    export circuit getCurrentBatch(): BatchedPositionUTXO {
+        return this.currentBatch;
+    }
+
+    export circuit getPosition(positionId: PositionId): PositionCommitment {
+        return this.positionCommitments.get(positionId);
+    }
+
+    export circuit isSettled(): Bool {
+        return this.settled;
+    }
+
+    export circuit canClaimWinnings(
+        outcome: Outcome,
+        currentTime: Timestamp
+    ): Bool {
+        return this.settled && 
+               this.resolution.outcome == outcome &&
+               currentTime <= this.metadata.challengePeriodEnd + this.cleanupPolicy.settlementDeadline;
+    }
+
+    export circuit getTotalVolume(): Field {
+        return this.state.totalVolume;
+    }
+
+    export circuit getFeesCollected(): Field {
+        return this.feeCollected;
+    }
+}
