@@ -1,5 +1,9 @@
 # Bodega Market Protocol Specification v1.0
 
+> **Related Documentation:**
+> - **[Threat Model & Security Analysis](./THREAT_MODEL.md)** - Comprehensive threat analysis, attack vectors, and mitigation strategies
+> - **[Component Architecture & Integration](./COMPONENT_ARCHITECTURE.md)** - Detailed system architecture, component breakdown, and deployment guide
+
 ## 1. Protocol Overview
 
 ### 1.1 Scope
@@ -10,8 +14,18 @@ Bodega Market is a privacy-preserving prediction market protocol built on Midnig
 - In-house oracle system for market resolution
 - Regulatory compliance through selective disclosure
 
-**Automated Market Making (AMM) - LMSR Implementation:**
-Bodega uses the Logarithmic Market Scoring Rule (LMSR), the gold standard for prediction market AMMs. LMSR provides superior price discovery with bounded losses for the market maker.
+**Automated Market Making (AMM) - Phased Implementation:**
+
+Bodega implements a phased approach to AMM pricing, starting with a simple Constant Product AMM and evolving toward the Logarithmic Market Scoring Rule (LMSR) as the underlying platform matures.
+
+**Phase 1 (Current): Constant Product AMM**
+- Simple and efficient: `k = sharesYes × sharesNo` (constant product)
+- Fully compatible with Compact's current limitations (no division, no exponentials)
+- Provides basic price discovery with proven mechanics
+- Implemented in all initial smart contracts
+
+**Phase 2-3 (Target): LMSR Implementation**
+The Logarithmic Market Scoring Rule (LMSR) is the gold standard for prediction market AMMs, providing superior price discovery with bounded losses for the market maker.
 
 **LMSR Core Formula:**
 
@@ -29,7 +43,7 @@ Price_i = e^(qᵢ/b) / (e^(q₁/b) + e^(q₂/b))
 **LMSR Advantages:**
 
 - **Bounded Losses**: Market maker losses capped by liquidity parameter
-- **Smooth Pricing**: Better price curves with less slippage for small trades  
+- **Smooth Pricing**: Better price curves with less slippage for small trades
 - **Asymptotic Behavior**: Prices approach but never reach 0 or 1
 - **Proven Design**: Used by Augur, Gnosis, and other successful prediction markets
 
@@ -38,6 +52,13 @@ Price_i = e^(qᵢ/b) / (e^(q₁/b) + e^(q₂/b))
 - Initial state: q₁=q₂=0 → prices both 50%
 - After 500 YES shares purchased: q₁=500, q₂=0 → YES price ≈ 62%
 - Market maker subsidy: ~693 NIGHT maximum loss
+
+**Implementation Roadmap:**
+- **Phase 1**: Constant Product AMM (MVP launch)
+- **Phase 2**: LMSR pricing off-chain with on-chain verification
+- **Phase 3**: Full on-chain LMSR when Compact adds advanced math operations
+
+See Section 5.3 for detailed implementation strategy.
 
 ### 1.2 Core Requirements
 
@@ -153,6 +174,21 @@ Price_i = e^(qᵢ/b) / (e^(q₁/b) + e^(q₂/b))
 - Market temporarily frozen
 - Requires governance intervention
 
+#### PAUSED
+
+- Market temporarily suspended
+- No new positions accepted
+- Existing positions remain locked
+- Can be resumed or cancelled by governance
+
+#### ARCHIVED
+
+- Final state after settlement complete
+- Market data moved to permanent storage (IPFS)
+- Position commitments removed from active state
+- Metadata and aggregated statistics retained on-chain
+- Market permanently closed and immutable
+
 ### 2.3 State Transition Rules
 
 **CREATED → ACTIVE:**
@@ -190,6 +226,13 @@ Price_i = e^(qᵢ/b) / (e^(q₁/b) + e^(q₂/b))
 - Oracle consensus reached (>66%)
 - Challenger bond returned or slashed
 - Normal settlement process resumes
+
+**SETTLED → ARCHIVED:**
+
+- Automatic after 90-day settlement period
+- Position commitments moved to IPFS
+- On-chain state pruned (except metadata)
+- Archival threshold configurable by governance
 
 ## 2.4 UTXO Batching and Scalability
 
@@ -692,12 +735,14 @@ enum Outcome {
 
 enum MarketStatus {
     CREATED = "CREATED",
-    ACTIVE = "ACTIVE", 
+    ACTIVE = "ACTIVE",
     ENDED = "ENDED",
     RESOLVED = "RESOLVED",
     SETTLED = "SETTLED",
     DISPUTED = "DISPUTED",
-    CANCELLED = "CANCELLED"
+    CANCELLED = "CANCELLED",
+    PAUSED = "PAUSED",
+    ARCHIVED = "ARCHIVED"
 }
 
 // Basic Types
