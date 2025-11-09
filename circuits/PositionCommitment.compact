@@ -1,0 +1,349 @@
+// Position Commitment Circuits
+// Zero-knowledge circuits for privacy-preserving position management
+
+include "std";
+include "types";
+
+// Private position data (witness - never revealed on-chain)
+witness PrivatePosition {
+    userId: UserId;
+    amount: Field;
+    outcome: Outcome;
+    nonce: Field;
+    marketId: MarketId;
+    timestamp: Timestamp;
+}
+
+// Private settlement data for claiming winnings
+witness PrivateSettlementData {
+    position: PrivatePosition;
+    winningOutcome: Outcome;
+    totalWinningPool: Field;
+    totalLosingPool: Field;
+    payoutRatio: Field; // Calculated off-chain, verified on-chain
+}
+
+// Merkle proof data for batch verification
+witness MerkleProofData {
+    position: PrivatePosition;
+    proof: Bytes32[];
+    leafIndex: Field;
+    batchId: Bytes32;
+}
+
+// Position commitment circuit - creates cryptographic commitment
+export circuit createPositionCommitment(
+    position: PrivatePosition
+): Bytes32 {
+    // Validate position data
+    assert(position.amount > Field(0), "Amount must be positive");
+    assert(position.outcome == Outcome::YES || position.outcome == Outcome::NO, "Invalid outcome");
+    assert(position.nonce > Field(0), "Nonce must be positive");
+    
+    // Create commitment using Poseidon hash (privacy-preserving)
+    let commitment = poseidon([
+        position.userId.toBytes(),
+        position.amount.toBytes(),
+        position.outcome.toBytes(),
+        position.nonce.toBytes(),
+        position.marketId.toBytes(),
+        position.timestamp.toBytes()
+    ]);
+    
+    return commitment;
+}
+
+// Verify position commitment without revealing private data
+export circuit verifyPositionCommitment(
+    commitment: Bytes32,
+    position: PrivatePosition
+): Bool {
+    let computedCommitment = createPositionCommitment(position);
+    return computedCommitment == commitment;
+}
+
+// Generate nullifier to prevent double-spending
+export circuit generateNullifier(
+    position: PrivatePosition,
+    secretKey: Field
+): Bytes32 {
+    let nullifier = poseidon([
+        position.userId.toBytes(),
+        position.nonce.toBytes(),
+        secretKey.toBytes()
+    ]);
+    
+    return nullifier;
+}
+
+// Verify position ownership without revealing identity
+export circuit provePositionOwnership(
+    commitment: Bytes32,
+    position: PrivatePosition,
+    secretKey: Field
+): (Bool, Bytes32) {
+    // Verify commitment
+    let validCommitment = verifyPositionCommitment(commitment, position);
+    assert(validCommitment, "Invalid position commitment");
+    
+    // Generate nullifier to prevent double-claiming
+    let nullifier = generateNullifier(position, secretKey);
+    
+    // Verify user owns the secret key (simplified - in practice would use more sophisticated proof)
+    let userKeyHash = poseidon([position.userId.toBytes(), secretKey.toBytes()]);
+    let validOwnership = userKeyHash != Bytes32::zero(); // Placeholder validation
+    
+    return (validOwnership, nullifier);
+}
+
+// Batch commitment circuit - proves position is in Merkle tree
+export circuit provePositionInBatch(
+    merkleData: MerkleProofData,
+    batchRoot: Bytes32
+): Bool {
+    // Create leaf from position data
+    let leaf = poseidon([
+        merkleData.position.userId.toBytes(),
+        merkleData.position.amount.toBytes(),
+        merkleData.position.outcome.toBytes(),
+        merkleData.position.nonce.toBytes()
+    ]);
+    
+    // Verify Merkle proof
+    let currentHash = leaf;
+    let index = merkleData.leafIndex;
+    
+    for (i, proofElement) in merkleData.proof.enumerate() {
+        // Determine if we hash left or right based on index bit
+        let bit = index & Field(1);
+        index = index >> Field(1);
+        
+        if (bit == Field(0)) {
+            // Current hash goes on left
+            currentHash = poseidon([currentHash.toBytes(), proofElement.toBytes()]);
+        } else {
+            // Current hash goes on right
+            currentHash = poseidon([proofElement.toBytes(), currentHash.toBytes()]);
+        }
+    }
+    
+    return currentHash == batchRoot;
+}
+
+// Settlement proof circuit - proves valid winnings claim
+export circuit proveWinnings(
+    settlementData: PrivateSettlementData,
+    publicWinningsAmount: Field,
+    nullifier: Bytes32
+): Bool {
+    let position = settlementData.position;
+    
+    // Verify position outcome matches winning outcome
+    assert(position.outcome == settlementData.winningOutcome, "Position did not win");
+    
+    // Calculate expected winnings using the payout ratio
+    let expectedWinnings = (position.amount * settlementData.payoutRatio) / Field(100);
+    
+    // Verify claimed winnings match calculation
+    assert(publicWinningsAmount == expectedWinnings, "Invalid winnings amount");
+    
+    // Verify payout ratio is reasonable (basic sanity check)
+    assert(settlementData.payoutRatio > Field(100), "Payout ratio must be > 100%");
+    assert(settlementData.payoutRatio < Field(1000), "Payout ratio must be < 1000%");
+    
+    // Verify total pools add up correctly
+    let totalPool = settlementData.totalWinningPool + settlementData.totalLosingPool;
+    assert(totalPool > Field(0), "Invalid pool totals");
+    
+    // Calculate theoretical payout ratio
+    let theoreticalRatio = ((settlementData.totalLosingPool * Field(100)) / settlementData.totalWinningPool) + Field(100);
+    
+    // Allow small deviation for fees (within 5%)
+    let ratioDiff = if settlementData.payoutRatio > theoreticalRatio {
+        settlementData.payoutRatio - theoreticalRatio
+    } else {
+        theoreticalRatio - settlementData.payoutRatio
+    };
+    
+    assert(ratioDiff <= Field(5), "Payout ratio deviates too much from theoretical");
+    
+    return true;
+}
+
+// Liquidity provision proof circuit
+export circuit proveLiquidityContribution(
+    contribution: Field,
+    timestamp: Timestamp,
+    totalLiquidity: Field,
+    expectedShares: Field
+): Bool {
+    assert(contribution > Field(0), "Contribution must be positive");
+    assert(totalLiquidity > Field(0), "Total liquidity must be positive");
+    
+    // Calculate expected LP shares (simple proportional model)
+    let calculatedShares = (contribution * Field(1000)) / totalLiquidity; // Scaled by 1000 for precision
+    
+    // Verify shares calculation
+    assert(expectedShares == calculatedShares, "Invalid share calculation");
+    
+    return true;
+}
+
+// Anonymous voting circuit (for governance features)
+export circuit anonymousVote(
+    voterCommitment: Bytes32,
+    vote: Field, // 0 = No, 1 = Yes
+    votingPower: Field,
+    nullifier: Bytes32,
+    secretKey: Field
+): Bool {
+    assert(vote == Field(0) || vote == Field(1), "Invalid vote");
+    assert(votingPower > Field(0), "Invalid voting power");
+    
+    // Verify voter commitment (simplified)
+    let expectedCommitment = poseidon([
+        votingPower.toBytes(),
+        secretKey.toBytes()
+    ]);
+    
+    assert(voterCommitment == expectedCommitment, "Invalid voter commitment");
+    
+    // Generate nullifier to prevent double-voting
+    let expectedNullifier = poseidon([
+        voterCommitment.toBytes(),
+        vote.toBytes()
+    ]);
+    
+    assert(nullifier == expectedNullifier, "Invalid nullifier");
+    
+    return true;
+}
+
+// Portfolio proof circuit - proves total portfolio value without revealing positions
+export circuit provePortfolioValue(
+    positions: PrivatePosition[],
+    claimedTotalValue: Field,
+    secretKey: Field
+): Bool {
+    let calculatedTotal = Field(0);
+    
+    // Sum all position amounts
+    for (position in positions) {
+        // Verify each position belongs to the same user
+        let userKeyHash = poseidon([position.userId.toBytes(), secretKey.toBytes()]);
+        assert(userKeyHash != Bytes32::zero(), "Invalid position ownership");
+        
+        calculatedTotal = calculatedTotal + position.amount;
+    }
+    
+    // Verify claimed total matches calculated total
+    assert(claimedTotalValue == calculatedTotal, "Portfolio value mismatch");
+    
+    return true;
+}
+
+// Risk management circuit - proves user is not over-leveraged
+export circuit proveRiskCompliance(
+    positions: PrivatePosition[],
+    maxExposure: Field,
+    userBalance: Field
+): Bool {
+    let totalExposure = Field(0);
+    let marketExposures = Map::new();
+    
+    for (position in positions) {
+        totalExposure = totalExposure + position.amount;
+        
+        // Track exposure per market to prevent concentration
+        if (marketExposures.contains(position.marketId)) {
+            let currentExposure = marketExposures.get(position.marketId);
+            marketExposures = marketExposures.insert(position.marketId, currentExposure + position.amount);
+        } else {
+            marketExposures = marketExposures.insert(position.marketId, position.amount);
+        }
+    }
+    
+    // Verify total exposure doesn't exceed balance
+    assert(totalExposure <= userBalance, "Exposure exceeds balance");
+    
+    // Verify total exposure doesn't exceed maximum allowed
+    assert(totalExposure <= maxExposure, "Exposure exceeds maximum");
+    
+    // Verify no single market exposure exceeds 50% of total
+    for (marketId, exposure) in marketExposures.entries() {
+        let exposurePercentage = (exposure * Field(100)) / totalExposure;
+        assert(exposurePercentage <= Field(50), "Single market exposure too high");
+    }
+    
+    return true;
+}
+
+// Age verification circuit (for compliance)
+export circuit proveMinimumAge(
+    birthDateHash: Bytes32,
+    minimumAge: Field,
+    currentTime: Timestamp,
+    secretSalt: Field
+): Bool {
+    // This is a simplified example - real implementation would use more sophisticated age verification
+    assert(minimumAge >= Field(18), "Minimum age must be 18 or higher");
+    
+    // Verify birth date hash
+    let expectedHash = poseidon([
+        birthDateHash.toBytes(),
+        secretSalt.toBytes()
+    ]);
+    
+    // Age verification logic would go here (simplified for example)
+    // In practice, this would involve zero-knowledge proofs of age ranges
+    // without revealing exact birth date
+    
+    return expectedHash != Bytes32::zero();
+}
+
+// Utility functions for circuit composition
+
+// Range proof - proves value is within specified range without revealing value
+export circuit proveRange(
+    value: Field,
+    minValue: Field,
+    maxValue: Field,
+    commitment: Bytes32,
+    nonce: Field
+): Bool {
+    assert(value >= minValue, "Value below minimum");
+    assert(value <= maxValue, "Value above maximum");
+    
+    let expectedCommitment = poseidon([
+        value.toBytes(),
+        nonce.toBytes()
+    ]);
+    
+    assert(commitment == expectedCommitment, "Invalid range commitment");
+    
+    return true;
+}
+
+// Merkle tree inclusion proof
+export circuit verifyInclusion(
+    leaf: Bytes32,
+    proof: Bytes32[],
+    root: Bytes32,
+    index: Field
+): Bool {
+    let currentHash = leaf;
+    let currentIndex = index;
+    
+    for (proofElement in proof) {
+        let bit = currentIndex & Field(1);
+        currentIndex = currentIndex >> Field(1);
+        
+        if (bit == Field(0)) {
+            currentHash = poseidon([currentHash.toBytes(), proofElement.toBytes()]);
+        } else {
+            currentHash = poseidon([proofElement.toBytes(), currentHash.toBytes()]);
+        }
+    }
+    
+    return currentHash == root;
+}

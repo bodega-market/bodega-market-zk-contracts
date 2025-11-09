@@ -1,0 +1,536 @@
+// Bodega Oracle Consensus System
+// Multi-oracle consensus with privacy-preserving voting and automatic failover
+
+include "std";
+include "types";
+
+// Oracle system ledger state
+ledger OracleConsensusLedger {
+    // Oracle management
+    registeredOracles: Map<OracleId, Address>;
+    oracleReputation: Map<OracleId, Field>;
+    oracleStakes: Map<OracleId, Field>;
+    activeOracles: Field;
+    
+    // Market-specific oracle assignments
+    marketOracles: Map<MarketId, OracleId[]>;
+    primaryOracles: Map<MarketId, OracleId>;
+    backupOracles: Map<MarketId, OracleId[]>;
+    
+    // Voting and consensus
+    marketVotes: Map<MarketId, Map<OracleId, OracleVote>>;
+    consensusResults: Map<MarketId, ConsensusResult>;
+    votingDeadlines: Map<MarketId, Timestamp>;
+    
+    // Dispute management
+    disputes: Map<Bytes32, DisputeData>;
+    disputeBonds: Map<Bytes32, Bond>;
+    
+    // System parameters
+    consensusThreshold: Field;      // 66 = 66% required
+    maxOracles: Field;              // 5 oracles max per market
+    votingPeriod: Field;           // 24 hours in seconds
+    disputePeriod: Field;          // 24 hours in seconds
+    oracleTimeoutPeriod: Field;    // 48 hours in seconds
+    
+    // Insurance fund
+    insuranceFund: Field;
+    insuranceClaims: Map<MarketId, Field>;
+    
+    // System admin
+    admin: Address;
+    paused: Bool;
+}
+
+struct DisputeData {
+    disputeId: Bytes32;
+    marketId: MarketId;
+    challenger: Address;
+    originalOutcome: Outcome;
+    disputedOutcome: Outcome;
+    evidence: String;
+    submittedAt: Timestamp;
+    resolved: Bool;
+    resolution: Outcome;
+}
+
+// Oracle consensus contract
+contract OracleConsensus {
+    
+    // Initialize oracle system
+    export circuit initialize(
+        admin: Address,
+        initialThreshold: Field,
+        initialVotingPeriod: Field
+    ): Void {
+        this.admin = admin;
+        this.consensusThreshold = initialThreshold;
+        this.maxOracles = MAX_ORACLES;
+        this.votingPeriod = initialVotingPeriod;
+        this.disputePeriod = Field(86400); // 24 hours
+        this.oracleTimeoutPeriod = Field(172800); // 48 hours
+        this.activeOracles = Field(0);
+        this.insuranceFund = Field(0);
+        this.paused = false;
+    }
+
+    // Register a new oracle
+    export circuit registerOracle(
+        oracle: Address,
+        oracleId: OracleId,
+        initialStake: Field,
+        caller: Address
+    ): Bool {
+        assert(caller == this.admin, "Only admin can register oracles");
+        assert(!this.paused, "System is paused");
+        assert(this.activeOracles < this.maxOracles, "Maximum oracles reached");
+        assert(initialStake > Field(0), "Stake must be positive");
+        
+        // Register oracle
+        this.registeredOracles = this.registeredOracles.insert(oracleId, oracle);
+        this.oracleReputation = this.oracleReputation.insert(oracleId, Field(100)); // Start with 100% reputation
+        this.oracleStakes = this.oracleStakes.insert(oracleId, initialStake);
+        this.activeOracles = this.activeOracles + Field(1);
+        
+        return true;
+    }
+
+    // Assign oracles to a market
+    export circuit assignOraclesToMarket(
+        marketId: MarketId,
+        primaryOracle: OracleId,
+        backupOracles: OracleId[],
+        caller: Address,
+        currentTime: Timestamp
+    ): Bool {
+        assert(caller == this.admin, "Only admin can assign oracles");
+        assert(!this.paused, "System is paused");
+        assert(backupOracles.length() <= Field(4), "Too many backup oracles"); // Max 1 primary + 4 backup
+        
+        // Verify all oracles are registered
+        assert(this.registeredOracles.contains(primaryOracle), "Primary oracle not registered");
+        for (oracleId in backupOracles) {
+            assert(this.registeredOracles.contains(oracleId), "Backup oracle not registered");
+        }
+        
+        // Create oracle assignment
+        let allOracles = [primaryOracle].concat(backupOracles);
+        this.marketOracles = this.marketOracles.insert(marketId, allOracles);
+        this.primaryOracles = this.primaryOracles.insert(marketId, primaryOracle);
+        this.backupOracles = this.backupOracles.insert(marketId, backupOracles);
+        
+        // Set voting deadline
+        let votingDeadline = currentTime + this.votingPeriod;
+        this.votingDeadlines = this.votingDeadlines.insert(marketId, votingDeadline);
+        
+        return true;
+    }
+
+    // Submit oracle vote (privacy-preserving)
+    export circuit submitOracleVote(
+        marketId: MarketId,
+        oracleId: OracleId,
+        outcome: Outcome,
+        confidence: Field,
+        evidence: String,
+        signature: Bytes,
+        currentTime: Timestamp
+    ): Bool {
+        assert(!this.paused, "System is paused");
+        assert(this.registeredOracles.contains(oracleId), "Oracle not registered");
+        assert(confidence >= Field(50) && confidence <= Field(100), "Invalid confidence range");
+        
+        // Verify oracle is assigned to this market
+        let assignedOracles = this.marketOracles.get(marketId);
+        let isAssigned = false;
+        for (assigned in assignedOracles) {
+            if (assigned == oracleId) {
+                isAssigned = true;
+                break;
+            }
+        }
+        assert(isAssigned, "Oracle not assigned to market");
+        
+        // Check voting deadline
+        let deadline = this.votingDeadlines.get(marketId);
+        assert(currentTime <= deadline, "Voting period ended");
+        
+        // Verify signature (oracle authentication)
+        let messageHash = poseidon(
+            marketId.toBytes(),
+            outcome.toBytes(),
+            confidence.toBytes(),
+            currentTime.toBytes()
+        );
+        let oracleAddress = this.registeredOracles.get(oracleId);
+        assert(this.verifySignature(messageHash, signature, oracleAddress), "Invalid signature");
+        
+        // Create vote
+        let vote = OracleVote {
+            oracleId: oracleId,
+            marketId: marketId,
+            outcome: outcome,
+            confidence: confidence,
+            evidence: evidence,
+            timestamp: currentTime,
+            signature: signature
+        };
+        
+        // Store vote (privacy-preserving - only commitment stored publicly)
+        let voteCommitment = poseidon(
+            vote.oracleId.toBytes(),
+            vote.outcome.toBytes(),
+            vote.confidence.toBytes(),
+            vote.timestamp.toBytes()
+        );
+        
+        // Update market votes
+        if (!this.marketVotes.contains(marketId)) {
+            this.marketVotes = this.marketVotes.insert(marketId, Map::new());
+        }
+        let marketVoteMap = this.marketVotes.get(marketId);
+        marketVoteMap = marketVoteMap.insert(oracleId, vote);
+        this.marketVotes = this.marketVotes.insert(marketId, marketVoteMap);
+        
+        return true;
+    }
+
+    // Calculate consensus (called after voting period ends)
+    export circuit calculateConsensus(
+        marketId: MarketId,
+        currentTime: Timestamp
+    ): ConsensusResult {
+        // Verify voting period has ended
+        let deadline = this.votingDeadlines.get(marketId);
+        assert(currentTime > deadline, "Voting period not ended");
+        
+        let marketVoteMap = this.marketVotes.get(marketId);
+        let assignedOracles = this.marketOracles.get(marketId);
+        
+        // Aggregate weighted votes
+        let yesScore = Field(0);
+        let noScore = Field(0);
+        let totalWeight = Field(0);
+        let participatingOracles = Field(0);
+        
+        for (oracleId in assignedOracles) {
+            if (marketVoteMap.contains(oracleId)) {
+                let vote = marketVoteMap.get(oracleId);
+                let reputation = this.oracleReputation.get(oracleId);
+                let weight = (reputation * vote.confidence) / Field(100);
+                
+                if (vote.outcome == Outcome::YES) {
+                    yesScore = yesScore + weight;
+                } else {
+                    noScore = noScore + weight;
+                }
+                
+                totalWeight = totalWeight + weight;
+                participatingOracles = participatingOracles + Field(1);
+            }
+        }
+        
+        // Determine consensus
+        let consensusReached = false;
+        let winningOutcome = Outcome::YES;
+        let confidence = Field(0);
+        
+        if (totalWeight > Field(0)) {
+            let yesPercentage = (yesScore * Field(100)) / totalWeight;
+            let noPercentage = (noScore * Field(100)) / totalWeight;
+            
+            if (yesPercentage >= this.consensusThreshold) {
+                consensusReached = true;
+                winningOutcome = Outcome::YES;
+                confidence = yesPercentage;
+            } else if (noPercentage >= this.consensusThreshold) {
+                consensusReached = true;
+                winningOutcome = Outcome::NO;
+                confidence = noPercentage;
+            }
+        }
+        
+        // Create consensus result
+        let result = ConsensusResult {
+            outcome: winningOutcome,
+            confidence: confidence,
+            participatingOracles: participatingOracles,
+            consensusReached: consensusReached,
+            disputeThreshold: Field(1000) // 1000 DUST required to dispute
+        };
+        
+        // Store result
+        this.consensusResults = this.consensusResults.insert(marketId, result);
+        
+        return result;
+    }
+
+    // Handle oracle timeout and activate backup
+    export circuit handleOracleTimeout(
+        marketId: MarketId,
+        timeoutOracle: OracleId,
+        currentTime: Timestamp
+    ): Bool {
+        let deadline = this.votingDeadlines.get(marketId);
+        assert(currentTime > deadline + this.oracleTimeoutPeriod, "Timeout period not reached");
+        
+        // Check if primary oracle timed out
+        let primaryOracle = this.primaryOracles.get(marketId);
+        if (primaryOracle == timeoutOracle) {
+            // Activate first backup oracle
+            let backups = this.backupOracles.get(marketId);
+            assert(backups.length() > Field(0), "No backup oracles available");
+            
+            let newPrimary = backups[0];
+            this.primaryOracles = this.primaryOracles.insert(marketId, newPrimary);
+            
+            // Penalize timed-out oracle
+            let currentReputation = this.oracleReputation.get(timeoutOracle);
+            let penalizedReputation = currentReputation - Field(10); // -10% reputation
+            this.oracleReputation = this.oracleReputation.insert(timeoutOracle, penalizedReputation);
+            
+            // Extend voting deadline for new primary oracle
+            let newDeadline = currentTime + this.votingPeriod;
+            this.votingDeadlines = this.votingDeadlines.insert(marketId, newDeadline);
+            
+            return true;
+        }
+        
+        return false;
+    }
+
+    // Submit dispute against consensus result
+    export circuit submitDispute(
+        marketId: MarketId,
+        disputedOutcome: Outcome,
+        evidence: String,
+        bondAmount: Field,
+        challenger: Address,
+        currentTime: Timestamp
+    ): Bytes32 {
+        assert(!this.paused, "System is paused");
+        assert(this.consensusResults.contains(marketId), "No consensus result found");
+        assert(bondAmount >= Field(1000_000_000), "Insufficient dispute bond"); // 1000 DUST
+        
+        let consensus = this.consensusResults.get(marketId);
+        assert(consensus.consensusReached, "No consensus to dispute");
+        assert(consensus.outcome != disputedOutcome, "Cannot dispute same outcome");
+        
+        // Create dispute ID
+        let disputeId = poseidon(
+            marketId.toBytes(),
+            challenger.toBytes(),
+            currentTime.toBytes()
+        );
+        
+        // Create dispute data
+        let dispute = DisputeData {
+            disputeId: disputeId,
+            marketId: marketId,
+            challenger: challenger,
+            originalOutcome: consensus.outcome,
+            disputedOutcome: disputedOutcome,
+            evidence: evidence,
+            submittedAt: currentTime,
+            resolved: false,
+            resolution: consensus.outcome // Default to original
+        };
+        
+        // Create dispute bond
+        let bond = Bond {
+            bondId: disputeId,
+            user: challenger,
+            amount: bondAmount,
+            bondType: Field(3), // Dispute bond
+            lockedAt: currentTime,
+            releaseConditions: Field(2), // Released if dispute succeeds
+            released: false,
+            slashed: false
+        };
+        
+        // Store dispute and bond
+        this.disputes = this.disputes.insert(disputeId, dispute);
+        this.disputeBonds = this.disputeBonds.insert(disputeId, bond);
+        
+        // Emit dispute event
+        emit DisputeSubmittedEvent {
+            marketId: marketId,
+            disputeId: disputeId,
+            challenger: challenger,
+            bond: bondAmount,
+            timestamp: currentTime
+        };
+        
+        return disputeId;
+    }
+
+    // Resolve dispute through additional oracle consensus
+    export circuit resolveDispute(
+        disputeId: Bytes32,
+        additionalVotes: OracleVote[],
+        finalOutcome: Outcome,
+        caller: Address,
+        currentTime: Timestamp
+    ): Bool {
+        assert(caller == this.admin, "Only admin can resolve disputes");
+        
+        let dispute = this.disputes.get(disputeId);
+        assert(!dispute.resolved, "Dispute already resolved");
+        
+        // Verify additional votes and calculate new consensus
+        let yesVotes = Field(0);
+        let noVotes = Field(0);
+        let totalVotes = Field(0);
+        
+        for (vote in additionalVotes) {
+            assert(this.registeredOracles.contains(vote.oracleId), "Invalid oracle");
+            
+            if (vote.outcome == Outcome::YES) {
+                yesVotes = yesVotes + Field(1);
+            } else {
+                noVotes = noVotes + Field(1);
+            }
+            totalVotes = totalVotes + Field(1);
+        }
+        
+        // Determine if dispute was valid
+        let disputeSuccessful = false;
+        if (totalVotes > Field(0)) {
+            let winningVotes = if finalOutcome == Outcome::YES { yesVotes } else { noVotes };
+            let winningPercentage = (winningVotes * Field(100)) / totalVotes;
+            disputeSuccessful = winningPercentage >= this.consensusThreshold;
+        }
+        
+        // Update dispute
+        let resolvedDispute = DisputeData {
+            ...dispute,
+            resolved: true,
+            resolution: finalOutcome
+        };
+        this.disputes = this.disputes.insert(disputeId, resolvedDispute);
+        
+        // Handle bond
+        let bond = this.disputeBonds.get(disputeId);
+        if (disputeSuccessful) {
+            // Release bond and reward challenger
+            let releasedBond = Bond {
+                ...bond,
+                released: true
+            };
+            this.disputeBonds = this.disputeBonds.insert(disputeId, releasedBond);
+            
+            // Update consensus result
+            let updatedConsensus = ConsensusResult {
+                outcome: finalOutcome,
+                confidence: Field(100), // Admin resolution = 100% confidence
+                participatingOracles: totalVotes,
+                consensusReached: true,
+                disputeThreshold: Field(1000)
+            };
+            this.consensusResults = this.consensusResults.insert(dispute.marketId, updatedConsensus);
+        } else {
+            // Slash bond for frivolous dispute
+            let slashedBond = Bond {
+                ...bond,
+                slashed: true
+            };
+            this.disputeBonds = this.disputeBonds.insert(disputeId, slashedBond);
+            
+            // Add slashed amount to insurance fund
+            this.insuranceFund = this.insuranceFund + bond.amount;
+        }
+        
+        return disputeSuccessful;
+    }
+
+    // Claim insurance for oracle failure
+    export circuit claimInsurance(
+        marketId: MarketId,
+        claimAmount: Field,
+        caller: Address
+    ): Bool {
+        assert(this.insuranceFund >= claimAmount, "Insufficient insurance funds");
+        assert(claimAmount <= Field(10_000_000_000), "Claim exceeds maximum"); // 10,000 NIGHT max
+        
+        // Verify oracle failure occurred (no consensus reached within timeout)
+        assert(!this.consensusResults.contains(marketId) || 
+               !this.consensusResults.get(marketId).consensusReached, 
+               "Oracle did not fail");
+        
+        // Process claim
+        this.insuranceFund = this.insuranceFund - claimAmount;
+        this.insuranceClaims = this.insuranceClaims.insert(marketId, claimAmount);
+        
+        return true;
+    }
+
+    // Verify cryptographic signature
+    circuit verifySignature(
+        messageHash: Bytes32,
+        signature: Bytes,
+        publicKey: Address
+    ): Bool {
+        // Use Midnight's native signature verification
+        return verify_ecdsa_signature(messageHash, signature, publicKey);
+    }
+
+    // Query functions
+    export circuit getConsensusResult(marketId: MarketId): ConsensusResult {
+        return this.consensusResults.get(marketId);
+    }
+
+    export circuit getOracleReputation(oracleId: OracleId): Field {
+        return this.oracleReputation.get(oracleId);
+    }
+
+    export circuit getMarketOracles(marketId: MarketId): OracleId[] {
+        return this.marketOracles.get(marketId);
+    }
+
+    export circuit getDispute(disputeId: Bytes32): DisputeData {
+        return this.disputes.get(disputeId);
+    }
+
+    export circuit getInsuranceFund(): Field {
+        return this.insuranceFund;
+    }
+
+    export circuit isOracleRegistered(oracleId: OracleId): Bool {
+        return this.registeredOracles.contains(oracleId);
+    }
+
+    export circuit hasConsensus(marketId: MarketId): Bool {
+        if (!this.consensusResults.contains(marketId)) {
+            return false;
+        }
+        return this.consensusResults.get(marketId).consensusReached;
+    }
+
+    // Admin functions
+    export circuit pause(caller: Address): Bool {
+        assert(caller == this.admin, "Only admin can pause");
+        this.paused = true;
+        return true;
+    }
+
+    export circuit unpause(caller: Address): Bool {
+        assert(caller == this.admin, "Only admin can unpause");
+        this.paused = false;
+        return true;
+    }
+
+    export circuit updateConsensusThreshold(
+        caller: Address,
+        newThreshold: Field
+    ): Bool {
+        assert(caller == this.admin, "Only admin can update threshold");
+        assert(newThreshold >= Field(51) && newThreshold <= Field(100), "Invalid threshold");
+        this.consensusThreshold = newThreshold;
+        return true;
+    }
+
+    export circuit fundInsurance(amount: Field): Bool {
+        this.insuranceFund = this.insuranceFund + amount;
+        return true;
+    }
+}

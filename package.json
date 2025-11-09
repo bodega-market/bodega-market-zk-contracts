@@ -1,0 +1,164 @@
+{
+  "name": "bodega-market-zk-contracts",
+  "version": "1.0.0",
+  "description": "Privacy-preserving prediction market contracts for Midnight blockchain",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "scripts": {
+    "build": "tsc",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "test:coverage": "vitest run --coverage",
+    "test:ui": "vitest --ui",
+    "lint": "eslint sdk tests --ext .ts,.js",
+    "lint:fix": "eslint sdk tests --ext .ts,.js --fix",
+    "format": "prettier --write \"sdk/**/*.ts\" \"tests/**/*.ts\" \"contracts/**/*.compact\"",
+    "format:check": "prettier --check \"sdk/**/*.ts\" \"tests/**/*.ts\" \"contracts/**/*.compact\"",
+    "compile:contracts": "echo 'Compact compilation would happen here'",
+    "compile:circuits": "echo 'Circuit compilation would happen here'",
+    "compile:all": "npm run compile:contracts && npm run compile:circuits",
+    "deploy:testnet": "node scripts/deploy-testnet.js",
+    "deploy:mainnet": "node scripts/deploy-mainnet.js",
+    "verify": "echo 'Contract verification would happen here'",
+    "clean": "rimraf dist coverage .compact",
+    "dev": "concurrently \"tsc --watch\" \"vitest --watch\"",
+    "docs": "typedoc --out docs sdk",
+    "cli": "node scripts/bodega-cli.js",
+    "example:create": "ts-node examples/create-market.ts",
+    "example:bet": "ts-node examples/place-bet.ts",
+    "audit": "npm audit --audit-level moderate",
+    "audit:fix": "npm audit fix",
+    "prepare": "husky install",
+    "prepack": "npm run build"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/bodega-market/bodega-market-zk-contracts.git"
+  },
+  "keywords": [
+    "prediction-markets",
+    "zero-knowledge",
+    "privacy",
+    "blockchain",
+    "midnight",
+    "zk-snarks",
+    "defi",
+    "smart-contracts"
+  ],
+  "author": "Bodega Market Team",
+  "license": "MIT",
+  "bugs": {
+    "url": "https://github.com/bodega-market/bodega-market-zk-contracts/issues"
+  },
+  "homepage": "https://github.com/bodega-market/bodega-market-zk-contracts#readme",
+  "dependencies": {
+    "@midnight/sdk": "^2.0.0",
+    "@midnight/compact-runtime": "^2.0.0",
+    "@midnight/crypto": "^2.0.0",
+    "@midnight/proof-system": "^2.0.0"
+  },
+  "devDependencies": {
+    "@types/node": "^20.10.0",
+    "@typescript-eslint/eslint-plugin": "^6.0.0",
+    "@typescript-eslint/parser": "^6.0.0",
+    "@vitest/coverage-c8": "^0.33.0",
+    "@vitest/ui": "^0.34.0",
+    "chalk": "^4.1.2",
+    "cli-table3": "^0.6.3",
+    "commander": "^11.0.0",
+    "concurrently": "^8.0.0",
+    "dotenv": "^16.3.1",
+    "eslint": "^8.50.0",
+    "eslint-config-prettier": "^9.0.0",
+    "eslint-plugin-prettier": "^5.0.0",
+    "husky": "^8.0.3",
+    "inquirer": "^8.2.6",
+    "lint-staged": "^15.0.0",
+    "ora": "^5.4.1",
+    "prettier": "^3.0.0",
+    "rimraf": "^5.0.0",
+    "ts-node": "^10.9.1",
+    "typescript": "^5.2.0",
+    "typedoc": "^0.25.0",
+    "vitest": "^0.34.0"
+  },
+  "engines": {
+    "node": ">=18.0.0",
+    "npm": ">=8.0.0"
+  },
+  "files": [
+    "dist",
+    "contracts",
+    "circuits",
+    "README.md",
+    "LICENSE",
+    "PROTOCOL_SPEC.md"
+  ],
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "require": "./dist/index.js",
+      "import": "./dist/index.mjs"
+    },
+    "./sdk": {
+      "types": "./dist/sdk/index.d.ts",
+      "require": "./dist/sdk/index.js",
+      "import": "./dist/sdk/index.mjs"
+    },
+    "./contracts": "./contracts/",
+    "./circuits": "./circuits/"
+  },
+  "lint-staged": {
+    "*.{ts,js}": [
+      "eslint --fix",
+      "prettier --write"
+    ],
+    "*.{json,md}": [
+      "prettier --write"
+    ],
+    "*.compact": [
+      "prettier --write --parser typescript"
+    ]
+  },
+  "husky": {
+    "hooks": {
+      "pre-commit": "lint-staged",
+      "pre-push": "npm test",
+      "commit-msg": "commitlint -E HUSKY_GIT_PARAMS"
+    }
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "funding": {
+    "type": "opencollective",
+    "url": "https://opencollective.com/bodega-market"
+  },
+  "config": {
+    "compact": {
+      "version": "3.0.0",
+      "networks": {
+        "testnet": {
+          "rpc": "https://testnet.midnight.network",
+          "contracts": {
+            "MarketFactory": "0x0000000000000000000000000000000000000001",
+            "PredictionMarket": "0x0000000000000000000000000000000000000002",
+            "OracleConsensus": "0x0000000000000000000000000000000000000003"
+          }
+        },
+        "mainnet": {
+          "rpc": "https://mainnet.midnight.network",
+          "contracts": {
+            "MarketFactory": "TBD",
+            "PredictionMarket": "TBD",
+            "OracleConsensus": "TBD"
+          }
+        }
+      }
+    }
+  },
+  "directories": {
+    "example": "examples",
+    "test": "tests"
+  }
+}

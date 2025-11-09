@@ -1,0 +1,223 @@
+// Bodega Market - Core Types
+// Privacy-preserving prediction market types for Midnight blockchain
+
+include "std";
+
+// Basic identifier types
+type MarketId = Bytes32;
+type PositionId = Bytes32;
+type OracleId = Bytes32;
+type UserId = Bytes32;
+
+// Market outcome enumeration
+enum Outcome {
+    YES = 0,
+    NO = 1
+}
+
+// Market lifecycle states
+enum MarketStatus {
+    CREATED = 0,
+    ACTIVE = 1,
+    ENDED = 2,
+    RESOLVED = 3,
+    SETTLED = 4,
+    DISPUTED = 5,
+    CANCELLED = 6,
+    EXPIRED = 7
+}
+
+// Oracle consensus status
+enum ConsensusStatus {
+    PENDING = 0,
+    REACHED = 1,
+    DISPUTED = 2,
+    FAILED = 3
+}
+
+// Market metadata structure
+struct MarketMetadata {
+    id: MarketId;
+    question: String;
+    description: String;
+    resolutionCriteria: String;
+    creator: Address;
+    endTime: Timestamp;
+    resolutionDeadline: Timestamp;
+    challengePeriodEnd: Timestamp;
+    creatorBond: Field;
+    minLiquidity: Field;
+    status: MarketStatus;
+    createdAt: Timestamp;
+}
+
+// Market state for AMM calculations
+struct MarketState {
+    id: MarketId;
+    sharesYes: Field;
+    sharesNo: Field;
+    invariant: Field;           // k = sharesYes * sharesNo for constant product
+    liquidityParameter: Field;  // b parameter for LMSR
+    totalVolume: Field;
+    activePositions: Field;
+    lastTradeTime: Timestamp;
+    batchCounter: Field;        // Counter for batch IDs
+}
+
+// Batched position UTXO structure
+struct BatchedPositionUTXO {
+    batchId: Bytes32;
+    merkleRoot: Bytes32;        // Root of position commitments
+    totalValue: Field;          // Sum of all positions in batch
+    positionCount: Field;       // Number of positions in batch
+    batchTimestamp: Timestamp;  // When batch was created
+    marketId: MarketId;         // Associated market
+    processed: Bool;            // Whether batch has been processed
+}
+
+// Individual position commitment (private)
+struct PositionCommitment {
+    commitment: Bytes32;        // Hash of private position data
+    amount: Field;              // Bet amount (for AMM calculations)
+    outcome: Outcome;           // YES or NO
+    timestamp: Timestamp;       // When position was created
+    batchId: Bytes32;          // Reference to batch
+    leafIndex: Field;          // Position in Merkle tree
+}
+
+// Oracle resolution data
+struct Resolution {
+    marketId: MarketId;
+    outcome: Outcome;
+    primaryOracle: OracleId;
+    submittedAt: Timestamp;
+    evidence: String;
+    bond: Field;
+    consensusReached: Bool;
+    confidence: Field;          // 0-100 confidence score
+    supportingOracles: Field;   // Number of supporting oracles
+}
+
+// Oracle vote (private witness data)
+struct OracleVote {
+    oracleId: OracleId;
+    marketId: MarketId;
+    outcome: Outcome;
+    confidence: Field;          // 0-100 confidence score
+    evidence: String;
+    timestamp: Timestamp;
+    signature: Bytes;           // Cryptographic signature
+}
+
+// Oracle consensus result
+struct ConsensusResult {
+    outcome: Outcome;
+    confidence: Field;
+    participatingOracles: Field;
+    consensusReached: Bool;
+    disputeThreshold: Field;
+}
+
+// Cleanup and archival structures
+struct CleanupPolicy {
+    settlementDeadline: Field;  // 90 days in seconds
+    archivalThreshold: Field;   // 180 days in seconds
+    batchCleanupSize: Field;    // Process N expired positions per cleanup
+    enabled: Bool;
+}
+
+struct MarketArchival {
+    marketId: MarketId;
+    finalState: MarketState;
+    ipfsHash: String;           // Complete market history on IPFS
+    archivedAt: Timestamp;
+    retainCommitments: Bool;    // Whether to keep individual commitments
+    retainAggregates: Bool;     // Whether to keep aggregated statistics
+}
+
+// Batch processing results
+struct BatchResult {
+    batchId: Bytes32;
+    totalYes: Field;
+    totalNo: Field;
+    processedCount: Field;
+    newStateRoot: Bytes32;
+    success: Bool;
+}
+
+// Settlement and payout structures
+struct Settlement {
+    positionId: PositionId;
+    marketId: MarketId;
+    winnings: Field;
+    claimed: Bool;
+    claimedAt: Timestamp;
+    payoutProof: Bytes32;       // ZK proof of valid payout
+}
+
+// Bond management
+struct Bond {
+    bondId: Bytes32;
+    user: Address;
+    amount: Field;
+    bondType: Field;            // 1=Creator, 2=Oracle, 3=Dispute
+    lockedAt: Timestamp;
+    releaseConditions: Field;   // Bitfield of conditions
+    released: Bool;
+    slashed: Bool;
+}
+
+// Error types for better debugging
+enum ErrorCode {
+    MARKET_NOT_FOUND = 1,
+    MARKET_ENDED = 2,
+    INSUFFICIENT_BOND = 3,
+    INVALID_PROOF = 4,
+    CONSENSUS_FAILED = 5,
+    EXPIRED_POSITION = 6,
+    DUPLICATE_VOTE = 7,
+    UNAUTHORIZED = 8
+}
+
+// Event structures for off-chain indexing
+struct MarketCreatedEvent {
+    marketId: MarketId;
+    creator: Address;
+    question: String;
+    endTime: Timestamp;
+    createdAt: Timestamp;
+}
+
+struct BatchProcessedEvent {
+    batchId: Bytes32;
+    marketId: MarketId;
+    positionCount: Field;
+    totalVolume: Field;
+    timestamp: Timestamp;
+}
+
+struct MarketResolvedEvent {
+    marketId: MarketId;
+    outcome: Outcome;
+    oracle: OracleId;
+    confidence: Field;
+    timestamp: Timestamp;
+}
+
+struct DisputeSubmittedEvent {
+    marketId: MarketId;
+    disputeId: Bytes32;
+    challenger: Address;
+    bond: Field;
+    timestamp: Timestamp;
+}
+
+// Constants for the protocol
+const CREATOR_BOND_AMOUNT: Field = 100_000_000;      // 100 NIGHT
+const DISPUTE_BOND_AMOUNT: Field = 1000_000_000;     // 1000 DUST
+const SETTLEMENT_DEADLINE: Field = 7776000;          // 90 days in seconds
+const ARCHIVAL_THRESHOLD: Field = 15552000;          // 180 days in seconds
+const MIN_CONSENSUS_THRESHOLD: Field = 66;           // 66% agreement required
+const MAX_ORACLES: Field = 5;                        // Maximum oracles per market
+const BATCH_WINDOW_SIZE: Field = 30;                 // 30 seconds per batch
+const MAX_BATCH_SIZE: Field = 100;                   // Max positions per batch
